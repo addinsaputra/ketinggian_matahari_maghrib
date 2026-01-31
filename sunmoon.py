@@ -65,16 +65,17 @@ __all__ = ["list_hijri_months", "hijri_month", "set_location", "convert_utc_to_l
 			"moon_illumination_width_utc", "moon_illumination_width_local",
 			"find_new_moon_dates", "ref_hijri_ijtima", "newmoon_hijri_month_utc", "newmoon_hijri_month_local_time", "refraction_horizon_degree",
 			"moonrise_moonset_utc", "moonrise_moonset_local", "print_angle", "print_timedelta", "print_timedelta_tz", "fajr_time_utc",
-			"fajr_time_local", "calc_timedelta_seconds"]
+			"fajr_time_local", "calc_timedelta_seconds", "get_weather_data_from_era5", "maghrib_time_local",
+			"sun_semidiameter_degrees"]
 
 global ts, ephem
 ts = api.load.timescale()
 _base_dir = os.path.dirname(__file__)
-_ephem_path = os.path.join(_base_dir, 'de421.bsp')
+_ephem_path = os.path.join(_base_dir, 'de440s.bsp')
 if not os.path.exists(_ephem_path):
-	_ephem_path = os.path.join(os.path.dirname(_base_dir), 'de421.bsp')
+	_ephem_path = os.path.join(os.path.dirname(_base_dir), 'de440s.bsp')
 if not os.path.exists(_ephem_path):
-	_ephem_path = os.path.join(os.getcwd(), 'de421.bsp')
+	_ephem_path = os.path.join(os.getcwd(), 'de440s.bsp')
 ephem = api.load_file(_ephem_path)
 
 def list_hijri_months(print_list=False):
@@ -105,8 +106,70 @@ def set_location(latitude, longitude, elevation):
 	return location
 
 
+def get_weather_data_from_era5(skyfield_location, target_utc, timezone_str='UTC', name='Location'):
+	"""Get temperature and pressure from Open-Meteo ERA5 API at a specific time.
+
+	Parameters
+	----------
+	skyfield_location : skyfield.toposlib.Topos
+		Location object from skyfield set_location function
+	target_utc : datetime
+		Timezone-aware UTC datetime for which to get weather data
+	timezone_str : str, optional
+		IANA timezone identifier (default: 'UTC')
+	name : str, optional
+		Name of the location (default: 'Location')
+
+	Returns
+	-------
+	tuple (float, float)
+		(temperature_C, pressure_mbar) - Temperature in Celsius and pressure in mbar
+
+	Raises
+	------
+	Exception
+		If the API request fails or data is missing
+	"""
+	# Extract coordinates from skyfield location
+	latitude = skyfield_location.latitude.degrees
+	longitude = skyfield_location.longitude.degrees
+
+	# Ensure target_utc is timezone-aware
+	from datetime import timezone as tz
+	if target_utc.tzinfo is None:
+		target_utc = target_utc.replace(tzinfo=tz.utc)
+
+	# Fetch hourly weather data from ERA5 API (temperature + pressure)
+	# surface_pressure from ERA5 is in hPa which equals mbar
+	date_str = target_utc.strftime("%Y-%m-%d")
+	df_weather = fetch_hourly_weather(
+		latitude=latitude,
+		longitude=longitude,
+		start_date=date_str,
+		end_date=date_str,
+		hourly_variables=["temperature_2m", "surface_pressure"],
+		timezone="UTC"
+	)
+
+	# Find the data closest to target time
+	df_weather['time_diff'] = abs(df_weather['date'] - target_utc)
+	idx_closest = df_weather['time_diff'].idxmin()
+	temp_c = float(df_weather.loc[idx_closest, 'temperature_2m'])
+
+	# Get pressure from ERA5 API (surface_pressure is in hPa = mbar)
+	if 'surface_pressure' in df_weather.columns:
+		pressure_mbar = float(df_weather.loc[idx_closest, 'surface_pressure'])
+	else:
+		# Fallback to standard pressure if not available
+		pressure_mbar = 1013.0
+
+	return temp_c, pressure_mbar
+
+
 def get_temperature_from_power_api(skyfield_location, target_utc, timezone_str='UTC', name='Location'):
 	"""Get temperature from Open-Meteo ERA5 API at a specific time.
+	
+	DEPRECATED: Use get_weather_data_from_era5() instead for both temperature and pressure.
 
 	Parameters
 	----------
@@ -123,37 +186,8 @@ def get_temperature_from_power_api(skyfield_location, target_utc, timezone_str='
 	-------
 	float
 		Temperature in degrees Celsius
-
-	Raises
-	------
-	Exception
-		If the API request fails or data is missing
 	"""
-	# Extract coordinates from skyfield location
-	latitude = skyfield_location.latitude.degrees
-	longitude = skyfield_location.longitude.degrees
-
-	# Ensure target_utc is timezone-aware
-	from datetime import timezone as tz
-	if target_utc.tzinfo is None:
-		target_utc = target_utc.replace(tzinfo=tz.utc)
-
-	# Fetch hourly weather data from ERA5 API
-	date_str = target_utc.strftime("%Y-%m-%d")
-	df_weather = fetch_hourly_weather(
-		latitude=latitude,
-		longitude=longitude,
-		start_date=date_str,
-		end_date=date_str,
-		hourly_variables=["temperature_2m"],
-		timezone="UTC"
-	)
-
-	# Find the data closest to target time
-	df_weather['time_diff'] = abs(df_weather['date'] - target_utc)
-	idx_closest = df_weather['time_diff'].idxmin()
-	temp_c = float(df_weather.loc[idx_closest, 'temperature_2m'])
-
+	temp_c, _ = get_weather_data_from_era5(skyfield_location, target_utc, timezone_str, name)
 	return temp_c
 
 
@@ -407,15 +441,16 @@ def sunrise_sunset_apparent_local(location, time_zone_str, year=None, month=None
 
 def sunrise_sunset_utc(location, year=None, month=None, day=None, temperature_C=10.0, pressure_mbar=1030.0, radius_degrees=0.2665, auto_temperature=False, timezone_str='UTC', location_name='Location'):
 
-	# Get temperature from POWER API if auto_temperature is enabled
+	# Get temperature and pressure from ERA5 API if auto_temperature is enabled
 	if auto_temperature:
 		from datetime import timezone as tz
 		# Create timezone-aware datetime for noon UTC on the given date
 		target_dt = datetime(year, month, day, 12, 0, 0, tzinfo=tz.utc)
 		try:
-			temperature_C = get_temperature_from_power_api(location, target_dt, timezone_str, location_name)
+			temperature_C, pressure_mbar = get_weather_data_from_era5(location, target_dt, timezone_str, location_name)
 		except Exception as e:
-			print(f"Warning: Failed to get temperature from POWER API ({e}). Using default value {temperature_C}°C")
+			print(f"Warning: Failed to get weather data from ERA5 API ({e}). Using default values T={temperature_C}°C, P={pressure_mbar}mbar")
+
 
 	# get corection due to elevation
 	elev = location.elevation
@@ -466,6 +501,93 @@ def sunrise_sunset_local(location, time_zone_str, year=None, month=None, day=Non
 	sunset_local = convert_utc_to_localtime(time_zone_str, utc_datetime=sunset_utc)
 
 	return sunrise_local, sunset_local
+
+
+def maghrib_time_local(location, time_zone_str, year=None, month=None, day=None,
+					   temperature_C=10.0, pressure_mbar=1030.0, radius_degrees=0.2665,
+					   add_minutes=0, auto_temperature=False, location_name='Location'):
+	"""Hitung waktu sholat Maghrib (waktu sunset + tambahan jika diperlukan).
+
+	Menurut mayoritas ulama, waktu Maghrib dimulai ketika matahari benar-benar
+	telah terbenam (seluruh piringan matahari hilang di horizon).
+
+	Parameters
+	----------
+	location : skyfield.toposlib.Topos
+		Lokasi pengamatan dari set_location()
+	time_zone_str : str
+		Zona waktu (contoh: "Asia/Jakarta", "Asia/Makassar", "Asia/Jayapura", "+7", "+8", "+9")
+	year, month, day : int
+		Tanggal untuk perhitungan
+	temperature_C : float, optional
+		Suhu dalam derajat Celsius untuk koreksi refraksi. Default: 10.0
+		Diabaikan jika auto_temperature=True.
+	pressure_mbar : float, optional
+		Tekanan udara dalam mbar untuk koreksi refraksi. Default: 1030.0
+		Diabaikan jika auto_temperature=True.
+	radius_degrees : float, optional
+		Semi-diameter matahari dalam derajat. Default: 0.2665
+	add_minutes : float, optional
+		Tambahan menit setelah sunset (untuk kehati-hatian/ijtihad). Default: 0.
+	auto_temperature : bool, optional
+		Jika True, ambil data temperature & pressure otomatis dari Open-Meteo API. Default: False.
+	location_name : str, optional
+		Nama lokasi untuk logging. Default: 'Location'.
+
+	Returns
+	-------
+	datetime
+		Waktu Maghrib dalam zona waktu lokal
+
+	Example
+	-------
+	>>> loc = set_location(-6.2, 106.8, 10)  # Jakarta
+	>>> maghrib = maghrib_time_local(loc, "Asia/Jakarta", 2026, 1, 21)
+	>>> print(f"Maghrib: {maghrib.strftime('%H:%M:%S')}")
+
+	# Dengan data cuaca otomatis
+	>>> maghrib = maghrib_time_local(loc, "Asia/Jakarta", 2026, 1, 21, auto_temperature=True)
+	"""
+	# Get weather data automatically if requested
+	if auto_temperature:
+		from datetime import timezone as tz
+		target_dt = datetime(year, month, day, 12, 0, 0, tzinfo=tz.utc)
+		try:
+			temperature_C, pressure_mbar = get_weather_data_from_era5(location, target_dt, time_zone_str, location_name)
+		except Exception as e:
+			print(f"Warning: Failed to get weather data from ERA5 API ({e}). Using default values T={temperature_C}°C, P={pressure_mbar}mbar")
+
+	_, sunset_local = sunrise_sunset_local(
+		location=location,
+		time_zone_str=time_zone_str,
+		year=year,
+		month=month,
+		day=day,
+		temperature_C=temperature_C,
+		pressure_mbar=pressure_mbar,
+		radius_degrees=radius_degrees,
+		auto_temperature=False,  # Already handled above
+		location_name=location_name
+	)
+
+	if add_minutes > 0 and sunset_local is not None:
+		maghrib = sunset_local + timedelta(minutes=add_minutes)
+	else:
+		maghrib = sunset_local
+
+	return maghrib
+
+
+def calc_timedelta_seconds(datetime1, datetime2):
+	"""Hitung selisih dua datetime dalam detik."""
+	td = datetime2 - datetime1
+	return (td.days * 86400.0) + td.seconds
+
+
+def print_angle(angle_degree):
+	"""Format sudut dalam derajat ke format derajat:menit:detik."""
+	return Angle(degrees=angle_degree).dstr(format=u'{0}{1}°{2:02}′{3:02}.{4:0{5}}″')
+
 
 
 def fajr_time_utc(location, year=None, month=None, day=None, temperature_C=10.0, pressure_mbar=1030.0, fajr_sun_altitude=-18.0):
@@ -536,15 +658,15 @@ def fajr_time_local(location, time_zone_str, year=None, month=None, day=None, te
 
 def moonrise_moonset_utc(location, year=None, month=None, day=None, temperature_C=23.0, pressure_mbar=1030.0, radius_degrees=0.2575, auto_temperature=False, timezone_str='UTC', location_name='Location'):
 
-	# Get temperature from POWER API if auto_temperature is enabled
+	# Get temperature and pressure from ERA5 API if auto_temperature is enabled
 	if auto_temperature:
 		from datetime import timezone as tz
 		# Create timezone-aware datetime for noon UTC on the given date
 		target_dt = datetime(year, month, day, 12, 0, 0, tzinfo=tz.utc)
 		try:
-			temperature_C = get_temperature_from_power_api(location, target_dt, timezone_str, location_name)
+			temperature_C, pressure_mbar = get_weather_data_from_era5(location, target_dt, timezone_str, location_name)
 		except Exception as e:
-			print(f"Warning: Failed to get temperature from POWER API ({e}). Using default value {temperature_C}°C")
+			print(f"Warning: Failed to get weather data from ERA5 API ({e}). Using default values T={temperature_C}°C, P={pressure_mbar}mbar")
 
 	# get corection due to elevation
 	elev = location.elevation
